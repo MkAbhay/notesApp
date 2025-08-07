@@ -39,7 +39,7 @@ export default function NotesPage() {
   const user = token ? parseJwt(token) : null;
 
   useEffect(() => {
-    const newSocket = io("ws://localhost:3500");
+    const newSocket = io(process.env.NEXT_PUBLIC_WS);
     setSocket(newSocket);
 
     newSocket.on("connect", () => {
