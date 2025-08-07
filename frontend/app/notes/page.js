@@ -1,4 +1,5 @@
 "use client";
+import { io } from "socket.io-client";
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
@@ -16,36 +17,127 @@ import {
 import api from "../../lib/api";
 import { getToken, clearToken } from "../../lib/auth";
 import { parseJwt } from "../../lib/jwt";
+import { useDebounce } from "use-debounce";
 
 export default function NotesPage() {
   const [notes, setNotes] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [socket, setSocket] = useState(null);
 
   const [open, setOpen] = useState(false);
   const [modalMode, setModalMode] = useState("new");
   const [editingNote, setEditingNote] = useState(null);
   const [form, setForm] = useState({ title: "", content: "", tags: "" });
 
+  const [searchQuery, setSearchQuery] = useState([]);
+  const [inputValue, setInputValue] = useState("");
+  const [debouncedSearch] = useDebounce(searchQuery, 400);
+
   const router = useRouter();
   const token = getToken();
   const user = token ? parseJwt(token) : null;
 
   useEffect(() => {
-    const fetchNotes = async () => {
-      try {
-        if (!token) return router.push("/login");
-        const res = await api.get(`/notes?user_id=${user.id}`);
-        const allNotes = res.data.response.data || [];
-        setNotes(allNotes);
-      } catch (err) {
-        setError("Failed to load notes");
-      } finally {
-        setLoading(false);
-      }
-    };
-    fetchNotes();
+    const newSocket = io("ws://localhost:3500");
+    setSocket(newSocket);
+
+    newSocket.on("connect", () => {
+      console.log("Socket connected:", newSocket.id);
+    });
+
+    return () => newSocket.disconnect();
   }, []);
+
+  useEffect(() => {
+    if (!socket) return;
+
+    const handleNoteUpdated = (data) => {
+      setNotes((prevNotes) =>
+        prevNotes.map((note) =>
+          note.id === data.id ? { ...note, ...data } : note
+        )
+      );
+    };
+
+    socket.on("note:updated", handleNoteUpdated);
+
+    return () => {
+      socket.off("note:updated", handleNoteUpdated);
+    };
+  }, [socket]);
+
+  const fetchNotes = async (tags) => {
+    try {
+      console.log({ tags });
+      const queryParams = new URLSearchParams();
+      if (tags.length) queryParams.append("tags", tags.join(","));
+
+      const res = await api.get(
+        `/notes?user_id=${user.id}&${queryParams.toString()}`
+      );
+      const allNotes = res.data.response.data || [];
+      setNotes(allNotes);
+
+      allNotes.forEach((note) => {
+        socket?.emit("note:join", note.id);
+      });
+    } catch (err) {
+      setError(`Failed to load notes | ${err}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleKeyDown = (e) => {
+    if ((e.key === "Enter" || e.key === ",") && inputValue.trim() !== "") {
+      e.preventDefault();
+      if (!searchQuery.includes(inputValue.trim())) {
+        setSearchQuery([...searchQuery, inputValue.trim()]);
+      }
+      setInputValue("");
+    }
+  };
+
+  const handleDelete = (tagToDelete) => {
+    setSearchQuery((tags) => tags.filter((tag) => tag !== tagToDelete));
+  };
+
+  useEffect(() => {
+    fetchNotes(debouncedSearch);
+  }, [debouncedSearch]);
+
+  useEffect(() => {
+    if (modalMode !== "edit" || !editingNote) return;
+
+    const timeout = setTimeout(async () => {
+      try {
+        const updatedNote = {
+          id: editingNote.id,
+          title: form.title,
+          content: form.content,
+          tags: parseTags(form.tags),
+          user_id: editingNote.user_id,
+        };
+
+        await api.post("/notes", updatedNote);
+        socket?.emit("note:update", {
+          noteId: editingNote.id,
+          data: updatedNote,
+        });
+
+        setNotes((prev) =>
+          prev.map((n) =>
+            n.id === editingNote.id ? { ...n, ...updatedNote } : n
+          )
+        );
+      } catch (err) {
+        console.error("Auto-update failed", err);
+      }
+    }, 1000);
+
+    return () => clearTimeout(timeout);
+  }, [form.title, form.content, form.tags]);
 
   const handleOpenNew = () => {
     setModalMode("new");
@@ -93,6 +185,11 @@ export default function NotesPage() {
       const res = await api.get(`/notes?user_id=${user.id}`);
       const allNotes = res.data.response.data || [];
       setNotes(allNotes);
+
+      allNotes.forEach((note) => {
+        socket?.emit("note:join", note.id);
+      });
+
       handleClose();
     } catch (err) {
       alert("Failed to save note.");
@@ -103,39 +200,6 @@ export default function NotesPage() {
     await api.delete(`/notes/${id}`);
     setNotes(notes.filter((n) => n.id !== id));
   };
-
-  useEffect(() => {
-    if (modalMode !== "edit" || !editingNote) return;
-
-    const timeout = setTimeout(async () => {
-      try {
-        await api.post("/notes", {
-          id: editingNote.id,
-          title: form.title,
-          content: form.content,
-          tags: parseTags(form.tags),
-          user_id: editingNote.user_id,
-        });
-
-        setNotes((prev) =>
-          prev.map((n) =>
-            n.id === editingNote.id
-              ? {
-                  ...n,
-                  title: form.title,
-                  content: form.content,
-                  tags: parseTags(form.tags),
-                }
-              : n
-          )
-        );
-      } catch (err) {
-        console.error("Auto-update failed", err);
-      }
-    }, 3000);
-
-    return () => clearTimeout(timeout);
-  }, [form.title, form.content, form.tags]);
 
   if (loading) return <Typography sx={{ mt: 4 }}>Loading...</Typography>;
   if (error)
@@ -151,6 +215,37 @@ export default function NotesPage() {
         }}
       >
         <Typography variant="h4">Your Notes</Typography>
+        <Box
+          sx={{
+            border: "1px solid #ccc",
+            borderRadius: "8px",
+            padding: "8px",
+            display: "flex",
+            flexWrap: "wrap",
+            gap: "4px",
+          }}
+        >
+          {searchQuery.map((tag, idx) => (
+            <Chip
+              key={idx}
+              label={tag}
+              onDelete={() => handleDelete(tag)}
+              sx={{ margin: "2px" }}
+            />
+          ))}
+
+          <TextField
+            variant="standard"
+            placeholder="Add tag..."
+            value={inputValue}
+            onChange={(e) => setInputValue(e.target.value)}
+            onKeyDown={handleKeyDown}
+            sx={{ minWidth: 120, flexGrow: 1 }}
+            InputProps={{
+              disableUnderline: true,
+            }}
+          />
+        </Box>
         <Box>
           <Button variant="contained" onClick={handleOpenNew}>
             + New Note
@@ -168,8 +263,6 @@ export default function NotesPage() {
         </Box>
       </Box>
 
-      {/* Removed Search Input and Tag Filters */}
-
       {notes.length === 0 ? (
         <Typography>No notes found.</Typography>
       ) : (
@@ -180,8 +273,6 @@ export default function NotesPage() {
               <Typography variant="body2" sx={{ mb: 1 }}>
                 {note.content}
               </Typography>
-
-              {/* Tags */}
               <Stack
                 direction="row"
                 spacing={1}
@@ -191,7 +282,6 @@ export default function NotesPage() {
                   <Chip key={tag} label={tag} size="small" />
                 ))}
               </Stack>
-
               <Button size="small" onClick={() => handleOpenEdit(note)}>
                 Edit
               </Button>
