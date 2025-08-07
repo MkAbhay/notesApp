@@ -3,10 +3,16 @@ const app = express();
 const http = require("http");
 const { Server } = require("socket.io");
 
-// HTTP server
+// http server
 const server = http.createServer(app);
 // webScoket
-const io = new Server(server);
+const io = new Server(server, {
+  cors: {
+    origin: "http://localhost:3000",
+    methods: ["GET", "POST"],
+    credentials: true,
+  },
+});
 
 io.on("connection", (socket) => {
   console.log("User connected:", socket.id);
